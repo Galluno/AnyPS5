@@ -42,7 +42,9 @@ constexpr int GuestNonBlockingState = 0x100;
 constexpr int GuestUnix = 1;
 constexpr int GuestTcpNoDelay = 1;
 constexpr int GuestReusePort = 0x200;
-constexpr int KeptFlags = 0x1 | GuestReuseAddress | 0x40 | GuestReusePort | 0x400 | 0x2000 | 0x10000;
+constexpr int GuestTimestamp = 0x400;
+constexpr int GuestBintime = 0x2000;
+constexpr int KeptFlags = 0x1 | GuestReuseAddress | 0x40 | GuestReusePort | GuestTimestamp | GuestBintime | 0x10000;
 constexpr int WriteOnlyFlags = 0x4000 | 0x8000;
 constexpr int GuestTcpNoDelayFlag = 4;
 constexpr int GuestTcpMaximumSegment = 2;
@@ -252,6 +254,16 @@ int SetSocketLevelOption(std::uintptr_t native, SocketOptionState& state, int fa
 #endif
             if (::setsockopt(handle, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<NativeOptionValue>(&reuseAddress), sizeof(reuseAddress))) return HostError();
         }
+#ifndef _WIN32
+        if ((option == GuestTimestamp || option == GuestBintime) && family != GuestUnix && type == 2) {
+            const int stamped = (flags & (GuestTimestamp | GuestBintime)) != 0 ? 1 : 0;
+#ifdef SO_TIMESTAMPNS
+            if (::setsockopt(handle, SOL_SOCKET, SO_TIMESTAMPNS, &stamped, sizeof(stamped))) return HostError();
+#else
+            if (::setsockopt(handle, SOL_SOCKET, SO_TIMESTAMP, &stamped, sizeof(stamped))) return HostError();
+#endif
+        }
+#endif
         state.keptFlags = flags;
         return 0;
     }

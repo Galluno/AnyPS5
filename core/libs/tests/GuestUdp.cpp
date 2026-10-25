@@ -1,6 +1,7 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/Api.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -91,6 +92,122 @@ static void CheckAddressLengths(int family) {
     Require(close_nid_postfix(sender) == 0 && close_nid_postfix(receiver) == 0);
 }
 
+struct StampRecord {
+    std::uint32_t length;
+    std::int32_t level;
+    std::int32_t type;
+    std::int32_t padding;
+    std::int64_t seconds;
+    std::uint64_t fraction;
+};
+
+static std::int64_t RealtimeNanos() {
+    KernelTimespec now{};
+    Require(clock_gettime_nid_postfix(0, &now) == 0);
+    return now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+static void CheckReceiveTimestamps(int family) {
+    const std::uint32_t addressSize = family == 2 ? 16 : 28;
+    const int receiver = socket_nid_postfix(family, 2, 0);
+    if (receiver < 0 && family == 28 && *__error_nid_postfix() == 47) return;
+    Require(receiver >= 0);
+    const int sender = socket_nid_postfix(family, 2, 0);
+    Require(sender >= 0);
+    std::array<unsigned char, 28> destination{};
+    destination[0] = static_cast<unsigned char>(addressSize);
+    destination[1] = static_cast<unsigned char>(family);
+    if (family == 2) { destination[4] = 127; destination[7] = 1; }
+    else destination[23] = 1;
+    const int bound = bind_nid_postfix(receiver, destination.data(), addressSize);
+    if (bound < 0 && family == 28 && *__error_nid_postfix() == 49) {
+        Require(close_nid_postfix(sender) == 0 && close_nid_postfix(receiver) == 0);
+        return;
+    }
+    Require(bound == 0);
+    std::uint32_t size = destination.size();
+    Require(getsockname_nid_postfix(receiver, destination.data(), &size) == 0);
+    Require(connect_nid_postfix(sender, destination.data(), addressSize) == 0);
+    const int enabled = 1;
+    const int disabled = 0;
+    Require(setsockopt_nid_postfix(receiver, 0xffff, 0x400, &enabled, sizeof(enabled)) == 0);
+    Require(setsockopt_nid_postfix(receiver, 0xffff, 0x2000, &enabled, sizeof(enabled)) == 0);
+    const auto wait = [&] {
+        int queued = 0;
+        for (int i = 0; i < 1000 && queued == 0; ++i) {
+            Require(ioctl_nid_postfix(receiver, 0x4004667f, &queued) == 0);
+            if (!queued) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Require(queued != 0);
+    };
+    const std::uint32_t expectedLength = family == 2 ? 64 : 32;
+    char data[8]{};
+    KernelIovec vector{data, sizeof(data)};
+    std::array<StampRecord, 3> control{};
+    const auto receive = [&](std::uint32_t capacity, int flags) {
+        std::memset(control.data(), 0xa5, sizeof(control));
+        GuestMsghdr message{nullptr, 0, &vector, 1, control.data(), capacity, -1};
+        Require(recvmsg_nid_postfix(receiver, &message, flags) == 4 && std::memcmp(data, "time", 4) == 0);
+        return message;
+    };
+    const auto before = RealtimeNanos();
+    Require(send_nid_postfix(sender, "time", 4, 0) == 4);
+    wait();
+    auto message = receive(sizeof(control), 2);
+    Require(message.flags == 2 && message.controlLength == expectedLength);
+    const auto timestamp = control[family == 2 ? 1 : 0];
+    Require(timestamp.length == 32 && timestamp.level == 0xffff && timestamp.type == 2 && timestamp.padding == 0);
+    Require(timestamp.fraction < 1000000);
+    const auto stamped = timestamp.seconds * 1000000000LL + static_cast<std::int64_t>(timestamp.fraction) * 1000;
+    Require(stamped >= before / 1000 * 1000 && stamped <= RealtimeNanos());
+    if (family == 2) {
+        const auto bintime = control[0];
+        Require(bintime.length == 32 && bintime.level == 0xffff && bintime.type == 4 && bintime.padding == 0);
+        const auto microseconds = (bintime.fraction >> 32) * 1000000 >> 32;
+        Require(bintime.seconds == timestamp.seconds && (microseconds == timestamp.fraction || microseconds + 1 == timestamp.fraction));
+    }
+    Require(reinterpret_cast<const unsigned char*>(control.data())[expectedLength] == 0xa5);
+    const auto peeked = control;
+    message = receive(sizeof(control), 0);
+    Require(message.flags == 0 && message.controlLength == expectedLength);
+#ifndef _WIN32
+    Require(std::memcmp(peeked.data(), control.data(), expectedLength) == 0);
+    bool arrival = false;
+    for (int attempt = 0; attempt < 100 && !arrival; ++attempt) {
+        Require(send_nid_postfix(sender, "time", 4, 0) == 4);
+        wait();
+        const auto queued = RealtimeNanos();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        message = receive(sizeof(control), 0);
+        const auto& latest = control[family == 2 ? 1 : 0];
+        arrival = latest.seconds * 1000000000LL + static_cast<std::int64_t>(latest.fraction) * 1000 <= queued;
+    }
+    Require(arrival);
+#endif
+    Require(send_nid_postfix(sender, "time", 4, 0) == 4);
+    wait();
+    message = receive(40, 2);
+    Require(message.controlLength == 32 && message.flags == (family == 2 ? 0x22 : 2));
+    Require(control[0].type == (family == 2 ? 4 : 2));
+    message = receive(31, 2);
+    Require(message.controlLength == 0 && message.flags == 0x22);
+    Require(reinterpret_cast<const unsigned char*>(control.data())[0] == 0xa5);
+    GuestMsghdr unrequested{nullptr, 0, &vector, 1, nullptr, 7, -1};
+    Require(recvmsg_nid_postfix(receiver, &unrequested, 0) == 4 && unrequested.flags == 0 && unrequested.controlLength == 0);
+    Require(setsockopt_nid_postfix(receiver, 0xffff, 0x400, &disabled, sizeof(disabled)) == 0);
+    Require(send_nid_postfix(sender, "time", 4, 0) == 4);
+    wait();
+    message = receive(sizeof(control), 0);
+    if (family == 2) Require(message.controlLength == 32 && message.flags == 0 && control[0].type == 4);
+    else Require(message.controlLength == 0 && message.flags == 0);
+    Require(setsockopt_nid_postfix(receiver, 0xffff, 0x2000, &disabled, sizeof(disabled)) == 0);
+    Require(send_nid_postfix(sender, "time", 4, 0) == 4);
+    wait();
+    message = receive(sizeof(control), 0);
+    Require(message.controlLength == 0 && message.flags == 0);
+    Require(close_nid_postfix(sender) == 0 && close_nid_postfix(receiver) == 0);
+}
+
 static void CheckSendToPortZero() {
     const int receiver = socket_nid_postfix(2, 2, 0);
     const int sender = socket_nid_postfix(2, 2, 0);
@@ -154,6 +271,8 @@ int main() {
     CheckAddressLengths(28);
     CheckDontWait();
     CheckSendToPortZero();
+    CheckReceiveTimestamps(2);
+    CheckReceiveTimestamps(28);
     const int receiver = socket_nid_postfix(2, 2, 0);
     const int sender = socket_nid_postfix(2, 2, 17);
     Require(receiver >= 0 && sender >= 0 && receiver != sender);

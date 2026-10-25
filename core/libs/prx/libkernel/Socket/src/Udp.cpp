@@ -42,6 +42,7 @@
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/RandomDevice.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
+#include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libkernel/Socket/include/SocketPoll.hpp"
 #include "prx/libkernel/Socket/include/SocketConnect.hpp"
@@ -1599,6 +1600,68 @@ static bool WriteGuest(void* destination, const void* source, std::size_t bytes)
     return true;
 #endif
 }
+constexpr int GuestTimestamp = 0x400;
+constexpr int GuestBintime = 0x2000;
+constexpr int GuestControlTruncated = 0x20;
+constexpr std::uint32_t StampRecordSize = 32;
+static KernelTimespec ReceiveTimeNow() {
+    KernelTimespec now{};
+    if (clock_gettime_nid_postfix(0, &now) != 0) throw std::runtime_error("recvmsg: reading CLOCK_REALTIME failed");
+    return now;
+}
+#ifndef _WIN32
+static ssize_t ReceiveStamped(NativeSocket native, char* data, std::size_t length, int flags, sockaddr_storage& address, socklen_t& size, KernelTimespec& arrival) {
+#ifdef SCM_TIMESTAMPNS
+    using HostStamp = timespec;
+#else
+    using HostStamp = timeval;
+#endif
+    iovec vector{data, length};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(HostStamp))];
+    msghdr message{};
+    message.msg_name = &address;
+    message.msg_namelen = size;
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    const auto received = ::recvmsg(native, &message, flags);
+    if (received < 0) return received;
+    size = message.msg_namelen;
+    arrival = ReceiveTimeNow();
+    for (auto* entry = CMSG_FIRSTHDR(&message); entry; entry = CMSG_NXTHDR(&message, entry)) {
+#ifdef SCM_TIMESTAMPNS
+        if (entry->cmsg_level != SOL_SOCKET || entry->cmsg_type != SCM_TIMESTAMPNS) continue;
+        HostStamp stamp;
+        std::memcpy(&stamp, CMSG_DATA(entry), sizeof(stamp));
+        arrival = {static_cast<std::int64_t>(stamp.tv_sec), static_cast<std::int64_t>(stamp.tv_nsec)};
+#else
+        if (entry->cmsg_level != SOL_SOCKET || entry->cmsg_type != SCM_TIMESTAMP) continue;
+        HostStamp stamp;
+        std::memcpy(&stamp, CMSG_DATA(entry), sizeof(stamp));
+        arrival = {static_cast<std::int64_t>(stamp.tv_sec), static_cast<std::int64_t>(stamp.tv_usec) * 1000};
+#endif
+    }
+    return received;
+}
+#endif
+static std::vector<unsigned char> StampRecords(int stamps, const KernelTimespec& arrival) {
+    std::vector<unsigned char> records;
+    const auto append = [&](int type, std::int64_t seconds, std::uint64_t fraction) {
+        unsigned char record[StampRecordSize]{};
+        const std::int32_t level = 0xffff;
+        std::memcpy(record, &StampRecordSize, sizeof(StampRecordSize));
+        std::memcpy(record + 4, &level, sizeof(level));
+        std::memcpy(record + 8, &type, sizeof(type));
+        std::memcpy(record + 16, &seconds, sizeof(seconds));
+        std::memcpy(record + 24, &fraction, sizeof(fraction));
+        records.insert(records.end(), record, record + sizeof(record));
+    };
+    const auto nanoseconds = static_cast<std::uint64_t>(arrival.tv_nsec);
+    if (stamps & GuestBintime) append(4, arrival.tv_sec, nanoseconds * 18446744073ULL);
+    if (stamps & GuestTimestamp) append(2, arrival.tv_sec, nanoseconds / 1000);
+    return records;
+}
 std::int64_t APS5_VABI recvmsg_nid_postfix(int descriptor, GuestMsghdr* message, int flags) {
     GuestMsghdr header{};
     if (!message || !ReadGuest(&header, message, sizeof(header))) return Fail(14);
@@ -1618,22 +1681,34 @@ std::int64_t APS5_VABI recvmsg_nid_postfix(int descriptor, GuestMsghdr* message,
     } catch (const std::bad_alloc&) {
         return Fail(55);
     }
+    int stamps = 0;
+    if (header.control && socket->family != GuestUnix && socket->type == 2) {
+        std::lock_guard lock(socket->modeMutex);
+        stamps = socket->options.keptFlags & (socket->family == 2 ? GuestTimestamp | GuestBintime : GuestTimestamp);
+    }
     sockaddr_storage native{};
     socklen_t size = 0;
     std::int64_t received = 0;
+    bool delivered = false;
+    KernelTimespec arrival{};
     if (total != 0 || socket->type == 1 || ReadableNow(*socket)) {
         size = sizeof(native);
         if (const int waited = WaitForTransfer(*socket, false, flags)) return Fail(waited);
+#ifdef _WIN32
         received = ::recvfrom(socket->value, buffer.data(), static_cast<int>(buffer.size()),
             NativeReceiveFlags(flags, socket->type), reinterpret_cast<sockaddr*>(&native), &size);
         if (received < 0) {
-#ifdef _WIN32
             if (!records || WSAGetLastError() != WSAEMSGSIZE) return Fail(NativeError());
             received = static_cast<std::int64_t>(buffer.size());
-#else
-            return Fail(NativeError());
-#endif
         }
+        if (stamps) arrival = ReceiveTimeNow();
+#else
+        received = stamps ? ReceiveStamped(socket->value, buffer.data(), buffer.size(), NativeReceiveFlags(flags, socket->type), native, size, arrival)
+                          : ::recvfrom(socket->value, buffer.data(), static_cast<int>(buffer.size()),
+                                NativeReceiveFlags(flags, socket->type), reinterpret_cast<sockaddr*>(&native), &size);
+        if (received < 0) return Fail(NativeError());
+#endif
+        delivered = true;
     }
     header.flags = flags;
     if (received > total) {
@@ -1659,7 +1734,19 @@ std::int64_t APS5_VABI recvmsg_nid_postfix(int descriptor, GuestMsghdr* message,
         if (!WriteGuest(header.name, address, header.nameLength)) return Fail(14);
         if (!WriteGuest(&message->nameLength, &header.nameLength, sizeof(header.nameLength))) return Fail(14);
     }
+    const auto capacity = header.controlLength;
     header.controlLength = 0;
+    if (header.control) {
+        const auto stamped = delivered && stamps ? StampRecords(stamps, arrival) : std::vector<unsigned char>{};
+        for (std::size_t offset = 0; offset < stamped.size(); offset += StampRecordSize) {
+            if (capacity - header.controlLength < StampRecordSize) {
+                header.flags |= GuestControlTruncated;
+                break;
+            }
+            if (!WriteGuest(static_cast<char*>(header.control) + header.controlLength, stamped.data() + offset, StampRecordSize)) return Fail(14);
+            header.controlLength += StampRecordSize;
+        }
+    }
     constexpr auto results = offsetof(GuestMsghdr, controlLength);
     if (!WriteGuest(reinterpret_cast<char*>(message) + results, reinterpret_cast<const char*>(&header) + results, sizeof(header) - results)) return Fail(14);
     return received;

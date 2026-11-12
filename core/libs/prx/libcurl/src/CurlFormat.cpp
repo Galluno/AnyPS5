@@ -152,6 +152,18 @@ private:
     bool failed = false;
 };
 
+class StreamOutput final : public IOutput {
+public:
+    explicit StreamOutput(FileStream* stream) : stream(stream) {}
+
+    bool Put(unsigned char value) override {
+        return fputc_nid_postfix(value, stream) != -1;
+    }
+
+private:
+    FileStream* stream;
+};
+
 bool IsDigit(char value) {
     return value >= '0' && value <= '9';
 }
@@ -639,6 +651,7 @@ private:
             std::size_t maxPrecision = WorkSize - 2;
             double magnitude = value;
             if (width > 0 && precision <= width) maxPrecision -= static_cast<std::size_t>(width);
+            if (magnitude > std::numeric_limits<double>::max()) throw std::domain_error("curl formatting of positive infinity with a precision does not terminate");
             while (magnitude >= 10.0) {
                 magnitude /= 10;
                 --maxPrecision;
@@ -711,6 +724,11 @@ char* FormatAllocated(const char* format, const void* args) {
     std::memcpy(copy, text.data(), text.size());
     copy[text.size()] = '\0';
     return copy;
+}
+
+int FormatStream(FileStream* stream, const char* format, const void* args) {
+    StreamOutput output(stream);
+    return Formatter(output, args).Run(format);
 }
 
 }

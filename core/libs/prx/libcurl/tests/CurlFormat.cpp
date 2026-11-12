@@ -1,10 +1,14 @@
 #include "prx/libcurl/src/CurlHost.hpp"
 #include "prx/libcurl/libcurl.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
+#include "prx/libc/include/Api.hpp"
 #include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
 #include <string>
 
 #if defined(__clang__) && !defined(_WIN32)
@@ -49,6 +53,26 @@ static char* APS5_VABI AllocatedList(const char* format, ...) {
     VaList list;
     std::memcpy(&list, args, sizeof(list));
     char* result = curl_mvaprintf_nid_postfix(format, &list);
+    __builtin_sysv_va_end(args);
+    return result;
+}
+
+static int APS5_VABI StreamList(FileStream* stream, const char* format, ...) {
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+    VaList list;
+    std::memcpy(&list, args, sizeof(list));
+    const int result = curl_mvfprintf_nid_postfix(stream, format, &list);
+    __builtin_sysv_va_end(args);
+    return result;
+}
+
+static int APS5_VABI StandardOutputList(const char* format, ...) {
+    __builtin_sysv_va_list args;
+    __builtin_sysv_va_start(args, format);
+    VaList list;
+    std::memcpy(&list, args, sizeof(list));
+    const int result = curl_mvprintf_nid_postfix(format, &list);
     __builtin_sysv_va_end(args);
     return result;
 }
@@ -161,6 +185,46 @@ static void TestUnboundedAndAllocated() {
     Require(curl_maprintf_nid_postfix("%s%s", large.c_str(), "bc") == nullptr);
 }
 
+static void TestStreams() {
+    const char* path = "guest_curl_format.tmp";
+    auto* stream = fopen_nid_postfix(path, "w+b");
+    Require(stream != nullptr);
+    std::int32_t count = -1;
+    Require(curl_mfprintf_nid_postfix(stream, "%s=%05d;%c%n", "key", 42, 0, &count) == 11);
+    Require(count == 11);
+    Require(StreamList(stream, "%ld|%.1f|%s", std::int64_t{-8000000000}, 1.5, nullptr) == 21);
+    rewind_nid_postfix(stream);
+    char contents[40] = {};
+    Require(fread_nid_postfix(contents, 1, sizeof(contents), stream) == 32);
+    Require(std::memcmp(contents, "key=00042;\0-8000000000|1.5|(nil)", 32) == 0);
+    Require(fclose_nid_postfix(stream) == 0);
+    stream = fopen_nid_postfix(path, "rb");
+    Require(stream != nullptr);
+    Require(curl_mfprintf_nid_postfix(stream, "abc") == 0);
+    Require(fclose_nid_postfix(stream) == 0);
+    Require(std::remove(path) == 0);
+    std::string tooMany;
+    for (int index = 0; index < 129; ++index) tooMany += "%d";
+    Require(curl_mprintf_nid_postfix(tooMany.c_str()) == -1);
+    Require(curl_mprintf_nid_postfix("%s %d\n", "curl format", 3) == 14);
+    Require(StandardOutputList("%s %lu\n", "curl format", std::uint64_t{10000000000}) == 24);
+    Require(fflush_nid_postfix(&_Stdout_nid_postfix) == 0);
+}
+
+static void TestInfinity() {
+    char buffer[32];
+    const double infinity = std::numeric_limits<double>::infinity();
+    Require(curl_msnprintf_nid_postfix(buffer, sizeof(buffer), "%f|%.2f", infinity, -infinity) == 8);
+    Require(Equals(buffer, "inf|-inf"));
+    bool thrown = false;
+    try {
+        curl_msnprintf_nid_postfix(buffer, sizeof(buffer), "%.2f", infinity);
+    } catch (const std::domain_error&) {
+        thrown = true;
+    }
+    Require(thrown);
+}
+
 int main() {
     ApplicationHeapInitialize_nid_no_patch(ApplicationEmptyProcessParameters_nid_no_patch());
     TestIntegers();
@@ -171,5 +235,7 @@ int main() {
     TestBounds();
     TestLists();
     TestUnboundedAndAllocated();
+    TestStreams();
+    TestInfinity();
     return 0;
 }

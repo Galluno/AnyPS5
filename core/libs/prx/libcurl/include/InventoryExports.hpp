@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <ctime>
 
+class FileStream;
+
 extern "C" {
 
 using guest_curl_lock_callback = void (APS5_VABI*)(CURL*, std::int32_t, std::int32_t, void*);
@@ -24,7 +26,7 @@ std::int32_t APS5_VABI curl_formadd_nid_postfix(struct guest_curl_httppost** htt
 std::int32_t APS5_VABI curl_multi_socket_action_nid_postfix(CURLM* multi_handle, int s, int ev_bitmask, int* running_handles);
 std::int32_t APS5_VABI curl_easy_recv_nid_postfix(CURL* curl, void* buffer, size_t buflen, size_t* n);
 void APS5_VABI curl_mime_free_nid_postfix(curl_mime* mime);
-int APS5_VABI curl_mvfprintf_nid_postfix(std::FILE* whereto, const char* format, VaList* args);
+int APS5_VABI curl_mvfprintf_nid_postfix(FileStream* whereto, const char* format, VaList* args);
 std::int32_t APS5_VABI curl_share_cleanup_nid_postfix(CURLSH* share_handle);
 std::int32_t APS5_VABI curl_easy_perform_nid_postfix(CURL* handle);
 std::int32_t APS5_VABI curl_multi_remove_handle_nid_postfix(CURLM* multi_handle, CURL* easy_handle);
@@ -39,7 +41,7 @@ std::int32_t APS5_VABI curl_url_get_nid_postfix(CURLU* handle, std::int32_t what
 const char* APS5_VABI curl_multi_strerror_nid_postfix(std::int32_t error);
 std::int32_t APS5_VABI curl_easy_setopt_nid_postfix(CURL* handle, std::int32_t option, ...);
 std::int32_t APS5_VABI curl_mime_data_nid_postfix(curl_mimepart* part, const char* data, size_t datasize);
-int APS5_VABI curl_mfprintf_nid_postfix(std::FILE* whereto, const char* format, ...);
+int APS5_VABI curl_mfprintf_nid_postfix(FileStream* whereto, const char* format, ...);
 std::int32_t APS5_VABI curl_multi_poll_nid_postfix(CURLM* multi_handle, struct guest_curl_waitfd extra_fds[], unsigned int extra_nfds, int timeout_ms, int* ret);
 void APS5_VABI curl_easy_cleanup_nid_postfix(CURL* handle);
 std::int32_t APS5_VABI curl_mime_name_nid_postfix(curl_mimepart* part, const char* name);
